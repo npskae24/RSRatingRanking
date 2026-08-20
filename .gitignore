@@ -1,0 +1,11 @@
+venv/
+driver/
+.idea/
+__pycache__/
+backup/
+log/
+set_stock_list/*
+!set_stock_list/th_holidays.csv
+*.xlsx
+watchlist_*.txt
+siamchart_missing_stocks.txt
