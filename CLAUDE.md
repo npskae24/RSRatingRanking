@@ -8,6 +8,8 @@ A script that computes IBD-style **RS Rating** (Relative Strength percentile ran
 
 ## Commands
 
+This repo has its own git history with a private GitHub remote (`npskae24/RSRatingRanking`) — `.gitignore` excludes `venv/`, `driver/`, `backup/`, `log/`, generated `set_stock_list/` snapshots, and per-run output (`*.xlsx`, `watchlist_*.txt`).
+
 No `requirements.txt`/`pyproject.toml` exists. **`python` on PATH may resolve to an unrelated venv missing deps (e.g. `selenium`) — use `py -3.12` (Windows py launcher) explicitly, not bare `python`, to hit the interpreter with everything installed.** The checked-in `venv/` is **broken** — it was created on a different machine (`C:\Users\Bank\...`) and its `pyvenv.cfg` points at a Python interpreter path that doesn't exist here. Don't try to activate it; use the system Python instead (this repo has been run successfully under Python 3.12, which already has pandas/numpy/yfinance/selenium/flask/requests/psutil installed — `html5lib` is the one package that had to be added manually, see below).
 
 Run the ranking script directly (CLI, writes files to the repo root):
