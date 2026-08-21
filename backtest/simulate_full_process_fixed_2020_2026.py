@@ -1,0 +1,327 @@
+"""
+Same as simulate_full_process_2020_2026.py, but with the two real spreadsheet bugs
+corrected (per `SCORING SYSTEM V1.3 (bugfix base-depth+prior-uptrend, 2026-08-21).xlsx`):
+  - BASE DEPTH: >=30% tier (score 1.8) now reachable - checked before >=25% (score 3),
+    restoring the intended <10%->3, [10%,25%)->6 (peak), [25%,30%)->3, >=30%->1.8 shape.
+  - PRIOR UPTREND: >=50% tier corrected 3.6->4.8, restoring the clean descending stair
+    6/5.4/4.8/3.6/2.4.
+Everything else (PART I RS Score/Breakout Area proxy, Base Length, Last T, VDU,
+Shakeout, 52WH/ATH Distance, MA10/20 Support, PART III) is identical to the
+bug-replicating run - see that script's docstring for full provenance/assumptions.
+"""
+import os
+import numpy as np
+import pandas as pd
+
+HERE = os.path.dirname(__file__)
+REPO_ROOT = os.path.dirname(HERE)
+PRICE_CACHE = os.path.join(HERE, "price_cache_2018_2026.csv")
+VOLUME_CACHE = os.path.join(HERE, "volume_cache_2018_2026.csv")
+LOW_CACHE = os.path.join(HERE, "low_cache_2018_2026.csv")
+SECTOR_HTML = os.path.join(REPO_ROOT, "set_stock_list", "listedCompanies_en_US.html")
+TRADE_LOG_CSV = os.path.join(HERE, "equity_sim_trades_fullprocess_fixed_2020_2026.csv")
+EQUITY_CSV = os.path.join(HERE, "equity_sim_curve_fullprocess_fixed_2020_2026.csv")
+
+PERIODS = [63, 126, 189, 252]
+WEIGHTS = [0.4, 0.2, 0.2, 0.2]
+RANKING_THRESHOLD = 0.8
+
+BASE_LOOKBACK = 20
+BASE_TIGHTNESS_MAX = 0.15
+BREAKOUT_LOOKBACK = 20
+VOLUME_AVG_WINDOW = 50
+BREAKOUT_VOLUME_MULT = 1.5
+MARKET_TREND_WINDOW = 50
+
+TRAIL_MA_WINDOW = 50
+HARD_STOP_PCT = 0.08
+POSITION_SIZE_PCT = 0.05
+REGIME_DOWN_SIZE_MULT = 0.75
+MAX_POSITIONS = 20
+
+PRIOR_UPTREND_WINDOW = 63
+LAST_T_WINDOW = 10
+VDU_LOOKBACK = 5
+VDU_RATIO_MAX = 0.7
+SHAKEOUT_UNDERCUT_PCT = 0.03
+
+PASS_THRESHOLD = 75.0
+
+SIM_START = pd.Timestamp("2020-01-02")
+SIM_END = pd.Timestamp("2026-06-30")
+STARTING_CAPITAL = 100_000.0
+
+
+def load_panel():
+    close = pd.read_csv(PRICE_CACHE, index_col=0, parse_dates=True).sort_index()
+    vol = pd.read_csv(VOLUME_CACHE, index_col=0, parse_dates=True).sort_index()
+    low = pd.read_csv(LOW_CACHE, index_col=0, parse_dates=True).sort_index()
+    close, vol = close.align(vol, join="inner")
+    close, low = close.align(low, join="inner")
+    vol = vol.reindex(columns=close.columns)
+    low = low.reindex(columns=close.columns)
+    return close, vol, low
+
+
+def load_sector_map(columns):
+    t = pd.read_html(SECTOR_HTML, header=1)[0]
+    sr = t.set_index("Symbol")["Sector"].astype(str)
+    bare = [c.split(".")[0] for c in columns]
+    sr = sr.reindex(bare)
+    sr.index = columns
+    return sr.replace("-", np.nan)
+
+
+def compute_rs_rank(close):
+    df_returns = pd.DataFrame(
+        index=close.index,
+        columns=pd.MultiIndex.from_product([close.columns, PERIODS], names=["SecCode", "Period"]),
+        dtype=float,
+    )
+    for p in PERIODS:
+        shifted = close.shift(p)
+        df_returns.loc[:, (slice(None), p)] = ((close - shifted) / shifted).values
+    weights_s = pd.Series(WEIGHTS, index=PERIODS)
+    df_rs = (
+        df_returns.stack(level=0, future_stack=True)
+        .mul(weights_s, axis=1)
+        .sum(axis=1, min_count=1)
+        .unstack(level=1)
+    )
+    return df_rs.rank(axis=1, pct=True)
+
+
+def select_ge(value_df, thresholds_desc, points_desc, below_points):
+    arr = value_df.values
+    conds = [arr >= t for t in thresholds_desc]
+    out = np.select(conds, points_desc, default=below_points)
+    return pd.DataFrame(out, index=value_df.index, columns=value_df.columns).where(value_df.notna())
+
+
+def select_le(value_df, thresholds_asc, points_desc, above_points):
+    arr = value_df.values
+    conds = [arr <= t for t in thresholds_asc]
+    out = np.select(conds, points_desc, default=above_points)
+    return pd.DataFrame(out, index=value_df.index, columns=value_df.columns).where(value_df.notna())
+
+
+def compute_signals(close, vol, low):
+    rs_rank = compute_rs_rank(close)
+
+    high_n = close.rolling(BASE_LOOKBACK).max()
+    low_n = close.rolling(BASE_LOOKBACK).min()
+    base_depth_pct = (high_n - low_n) / low_n
+    tight_base = base_depth_pct <= BASE_TIGHTNESS_MAX
+    tight_base_prev = tight_base.shift(1)
+
+    prior_high = close.shift(1).rolling(BREAKOUT_LOOKBACK).max()
+    vol_ratio = vol / vol.rolling(VOLUME_AVG_WINDOW).mean()
+    breakout_with_volume = (close > prior_high) & (vol_ratio >= BREAKOUT_VOLUME_MULT)
+
+    high_252d = close.rolling(252).max()
+    high_to_close_252d = high_252d / close - 1.0
+    ath_running = close.expanding().max()
+    ath_dist = ath_running / close - 1.0
+    avg_value_20d = (close * vol).rolling(20).mean()
+
+    sector_map = load_sector_map(close.columns)
+    sector_rs = rs_rank.T.groupby(sector_map).mean().T
+    sector_rs_per_stock = pd.DataFrame(
+        {s: sector_rs[sector_map[s]] if pd.notna(sector_map[s]) and sector_map[s] in sector_rs.columns
+         else pd.Series(np.nan, index=rs_rank.index)
+         for s in close.columns}
+    )
+
+    market_index = (1 + close.pct_change(fill_method=None).mean(axis=1).fillna(0)).cumprod()
+    regime_up = market_index > market_index.rolling(MARKET_TREND_WINDOW).mean()
+    ma_trail = close.rolling(TRAIL_MA_WINDOW).mean()
+    ma10 = close.rolling(10).mean()
+    ma20 = close.rolling(20).mean()
+
+    # --- PART I (50) ---
+    rs_pct_x100 = rs_rank * 100.0
+    rs_score = select_ge(rs_pct_x100, [97, 95, 90, 85, 80], [40, 36, 32, 16, 8], below_points=0)
+    tight_base_prev_bool = tight_base_prev.fillna(False).astype(bool)
+    breakout_area = pd.DataFrame(
+        np.where(tight_base_prev_bool.values & breakout_with_volume.values, 10.0,
+                 np.where(breakout_with_volume.values, 8.0, 0.0)),
+        index=close.index, columns=close.columns,
+    )
+
+    # --- PART II (30) ---
+    # PRIOR UPTREND (6) - FIXED: clean descending stair 6/5.4/4.8/3.6/2.4 (was 6/5.4/3.6/3.6/2.4).
+    prior_uptrend_pct = close.shift(BASE_LOOKBACK) / close.shift(BASE_LOOKBACK + PRIOR_UPTREND_WINDOW) - 1.0
+    row_uptrend = select_ge(prior_uptrend_pct, [1.0, 0.75, 0.5, 0.25, 0.0], [6.0, 5.4, 4.8, 3.6, 2.4], below_points=0.0)
+
+    # BASE DEPTH (6) - FIXED: >=30% tier (1.8) now reachable, checked before >=25% (3).
+    row_depth = pd.DataFrame(
+        np.select(
+            [base_depth_pct.values < 0.1, base_depth_pct.values < 0.25, base_depth_pct.values >= 0.3],
+            [3.0, 6.0, 1.8],
+            default=3.0,
+        ),
+        index=close.index, columns=close.columns,
+    ).where(base_depth_pct.notna())
+
+    tight_10 = ((close.rolling(10).max() - close.rolling(10).min()) / close.rolling(10).min()) <= BASE_TIGHTNESS_MAX
+    tight_15 = ((close.rolling(15).max() - close.rolling(15).min()) / close.rolling(15).min()) <= BASE_TIGHTNESS_MAX
+    tight_45 = ((close.rolling(45).max() - close.rolling(45).min()) / close.rolling(45).min()) <= BASE_TIGHTNESS_MAX
+    row_length = pd.DataFrame(
+        np.select(
+            [tight_45.shift(1).fillna(False).values, tight_15.shift(1).fillna(False).values,
+             tight_10.shift(1).fillna(False).values],
+            [6.0, 4.8, 3.0],
+            default=1.5,
+        ),
+        index=close.index, columns=close.columns,
+    )
+
+    sub_high = close.rolling(LAST_T_WINDOW).max().shift(1)
+    sub_low = close.rolling(LAST_T_WINDOW).min().shift(1)
+    last_t_pct = (sub_high - sub_low) / sub_high
+    row_last_t = pd.DataFrame(
+        np.select(
+            [last_t_pct.values >= 0.07, last_t_pct.values >= 0.04, last_t_pct.values >= 0.03],
+            [0.0, 1.5, 3.0],
+            default=2.25,
+        ),
+        index=close.index, columns=close.columns,
+    ).where(last_t_pct.notna())
+
+    vdu = (vol.rolling(VDU_LOOKBACK).mean().shift(1) < VDU_RATIO_MAX * vol.rolling(VOLUME_AVG_WINDOW).mean().shift(1))
+    row_vdu = vdu.astype(float) * 1.0
+
+    base_low_established = low.rolling(BASE_LOOKBACK).min().shift(1)
+    shakeout_day = (low < base_low_established * (1 - SHAKEOUT_UNDERCUT_PCT)) & (close >= base_low_established)
+    shakeout_in_base = shakeout_day.rolling(BASE_LOOKBACK).max().fillna(0).astype(bool)
+    row_shakeout = shakeout_in_base.astype(float) * 1.0
+
+    row_52wh = select_le(high_to_close_252d, [0.05, 0.15], [3.0, 1.2], above_points=0.0)
+    row_ath = select_le(ath_dist, [0.05, 0.15], [2.0, 0.8], above_points=0.0)
+
+    ma_support = (close.shift(1) > ma10.shift(1)) & (close.shift(1) > ma20.shift(1))
+    row_ma_support = ma_support.astype(float) * 2.0
+
+    part2_total = (row_uptrend.fillna(0) + row_depth.fillna(0) + row_length.fillna(0) + row_last_t.fillna(0)
+                   + row_vdu.fillna(0) + row_shakeout.fillna(0) + row_52wh.fillna(0) + row_ath.fillna(0)
+                   + row_ma_support.fillna(0))
+
+    # --- PART III (20) ---
+    row_breakout_confirmed = breakout_with_volume.astype(float) * 4.0
+    row_vol_ratio = select_ge(vol_ratio, [3.0, 2.0, 1.5, 1.0], [4.0, 3.4, 2.8, 2.2], below_points=1.2)
+    row_tight_base = tight_base.astype(float) * 4.0
+    row_h2c = select_ge(1 - high_to_close_252d, [0.95, 0.85, 0.70], [4.0, 2.8, 1.6], below_points=0.0)
+    row_sector_rs = select_ge(sector_rs_per_stock, [0.8, 0.6, 0.4], [2.0, 1.4, 0.8], below_points=0.0)
+    row_avg_value = select_ge(avg_value_20d, [20_000_000, 5_000_000, 1_000_000], [2.0, 1.4, 0.8], below_points=0.0)
+
+    part3_total = (row_breakout_confirmed.fillna(0) + row_vol_ratio.fillna(0) + row_tight_base.fillna(0)
+                   + row_h2c.fillna(0) + row_sector_rs.fillna(0) + row_avg_value.fillna(0))
+
+    total_score = rs_score.fillna(0) + breakout_area.fillna(0) + part2_total + part3_total
+    entry_signal = (rs_rank >= RANKING_THRESHOLD) & (total_score >= PASS_THRESHOLD)
+
+    return rs_rank, total_score, entry_signal, regime_up, ma_trail
+
+
+def simulate(close, rs_rank, total_score, entry_signal, regime_up, ma_trail):
+    dates = close.index[(close.index >= SIM_START) & (close.index <= SIM_END)]
+    cash = STARTING_CAPITAL
+    positions = {}
+    equity_curve = []
+    trade_log = []
+
+    for d in dates:
+        px = close.loc[d]
+
+        for sym in list(positions.keys()):
+            p = px.get(sym, np.nan)
+            if pd.isna(p):
+                continue
+            entry_price = positions[sym]["entry_price"]
+            ma = ma_trail.at[d, sym] if sym in ma_trail.columns else np.nan
+            hard_stop_hit = (p / entry_price - 1) <= -HARD_STOP_PCT
+            trail_hit = (not pd.isna(ma)) and (p < ma)
+            if hard_stop_hit or trail_hit:
+                shares = positions[sym]["shares"]
+                cash += shares * p
+                trade_log.append({
+                    "symbol": sym,
+                    "entry_date": positions[sym]["entry_date"], "exit_date": d,
+                    "entry_price": entry_price, "exit_price": p,
+                    "return_pct": p / entry_price - 1,
+                    "reason": "hard_stop" if hard_stop_hit else "trail_ma50",
+                })
+                del positions[sym]
+
+        held_value = sum(positions[s]["shares"] * px.get(s, positions[s]["entry_price"]) for s in positions)
+        equity = cash + held_value
+
+        slots = MAX_POSITIONS - len(positions)
+        if slots > 0:
+            todays_signal = entry_signal.loc[d]
+            candidates = todays_signal[todays_signal].index.difference(list(positions.keys()))
+            if len(candidates) > 0:
+                cand_score = total_score.loc[d, candidates].sort_values(ascending=False)
+                chosen = cand_score.index[:slots]
+                size_mult = 1.0 if bool(regime_up.loc[d]) else REGIME_DOWN_SIZE_MULT
+                for sym in chosen:
+                    p = px.get(sym, np.nan)
+                    if pd.isna(p) or p <= 0:
+                        continue
+                    alloc = min(equity * POSITION_SIZE_PCT * size_mult, cash)
+                    if alloc <= 0:
+                        continue
+                    shares = alloc / p
+                    cash -= alloc
+                    positions[sym] = {"shares": shares, "entry_price": p, "entry_date": d}
+
+        held_value = sum(positions[s]["shares"] * px.get(s, positions[s]["entry_price"]) for s in positions)
+        equity = cash + held_value
+        equity_curve.append((d, equity, cash, len(positions)))
+
+    equity_df = pd.DataFrame(equity_curve, columns=["date", "equity", "cash", "n_positions"]).set_index("date")
+    trade_df = pd.DataFrame(trade_log)
+    return equity_df, trade_df
+
+
+def max_drawdown(equity_sr):
+    running_max = equity_sr.cummax()
+    return (equity_sr / running_max - 1).min()
+
+
+def cagr(equity_sr):
+    n_years = (equity_sr.index[-1] - equity_sr.index[0]).days / 365.25
+    return (equity_sr.iloc[-1] / equity_sr.iloc[0]) ** (1 / n_years) - 1
+
+
+def main():
+    close, vol, low = load_panel()
+    print(f"Panel: {close.shape}, {close.index.min()} to {close.index.max()}")
+
+    rs_rank, total_score, entry_signal, regime_up, ma_trail = compute_signals(close, vol, low)
+    sim_dates = close.index[(close.index >= SIM_START) & (close.index <= SIM_END)]
+    n_cand = entry_signal.loc[sim_dates].sum(axis=1)
+    print(f"Candidates/day passing RS>=80 AND score>=75: mean={n_cand.mean():.2f}, "
+          f"median={n_cand.median():.0f}, days with 0 candidates={ (n_cand==0).sum() }/{len(n_cand)}")
+
+    equity_df, trade_df = simulate(close, rs_rank, total_score, entry_signal, regime_up, ma_trail)
+    equity_df.to_csv(EQUITY_CSV)
+    trade_df.to_csv(TRADE_LOG_CSV, index=False)
+
+    print(f"\n=== Fixed literal ACE>=75/100 scoring (bugs corrected), trailing-MA50/-8%stop exit ===")
+    print(f"Start: {STARTING_CAPITAL:,.0f} THB on {equity_df.index[0].date()}")
+    print(f"End:   {equity_df['equity'].iloc[-1]:,.0f} THB on {equity_df.index[-1].date()}")
+    print(f"CAGR:  {cagr(equity_df['equity'])*100:.2f}%")
+    print(f"Max drawdown: {max_drawdown(equity_df['equity'])*100:.2f}%")
+    print(f"Total trades: {len(trade_df)}")
+    if len(trade_df):
+        wins = trade_df[trade_df['return_pct'] > 0]
+        losses = trade_df[trade_df['return_pct'] <= 0]
+        print(f"Win rate: {len(wins)/len(trade_df)*100:.1f}%")
+        print(f"Avg gain: {wins['return_pct'].mean()*100:.2f}%  Avg loss: {losses['return_pct'].mean()*100:.2f}%")
+
+    print(f"\nSaved equity curve to {EQUITY_CSV}, trade log to {TRADE_LOG_CSV}")
+
+
+if __name__ == "__main__":
+    main()

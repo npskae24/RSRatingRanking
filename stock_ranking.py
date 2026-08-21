@@ -28,7 +28,9 @@ RANKING_THRESHOLD:         float = 0.8
 SKIP_NAME_DOWNLOAD:        bool = False  # Skip downloading stock names from SET exchange
 SKIP_PRICE_DOWNLOAD:       bool = False  # Skip downloading price from Yahoo Finance
 SKIP_TODAY_PRICE_DOWNLOAD: bool = True   # Skip downloading today price from alternative source.
-SKIP_STOCK_STATISTICS:     bool = False  # Skip stats download
+SKIP_STOCK_STATISTICS:     bool = True   # Skip fundamentals stats download - Thai .BK fundamentals via
+                                          # yfinance .info are too incomplete/unreliable to depend on;
+                                          # the system is 100%-technical now (see Stats: Technical below).
 SKIP_DATA_DUMP:            bool = False  # Skip downloaded price, calculated returns dump at the end of script
 PRODUCE_WATCHLIST:         bool = True   # Producting watchlist_{date}.txt
 DAILY_OPERATION:           bool = True   # Script only computes the daily data.
@@ -39,6 +41,14 @@ N_PRICE_THRESHOLD_UNDERLYING: int = 3  # If a stock has less that this no. price
 
 PERIODS:   list[int] = [63, 126, 189, 252]  # in bars/trading days
 WEIGHTS: list[float] = [0.4, 0.2, 0.2, 0.2]
+
+# Const: Technical pattern / regime detection (price+volume only, no fundamentals needed)
+BASE_LOOKBACK:        int = 20    # trading days for tight-base / consolidation range
+BASE_TIGHTNESS_MAX:   float = 0.15  # max (rolling high - rolling low)/low over BASE_LOOKBACK to flag "tight base"
+BREAKOUT_LOOKBACK:    int = 20    # trading days for prior-high breakout check
+VOLUME_AVG_WINDOW:    int = 50    # trading days for average-volume baseline
+BREAKOUT_VOLUME_MULT: float = 1.5   # volume must exceed this multiple of its baseline to confirm breakout
+MARKET_TREND_WINDOW:  int = 50    # trading days MA for market-regime trend (equal-weight SET proxy)
 
 # Const: Required fundamental stats (yfinance Ticker.info field name -> friendly output column name)
 REQUIRED_STATS_FUNDAMENTALS: dict[str, str] = {
@@ -62,13 +72,15 @@ __CONNECTION_MAX_RETRIES: int = 3
 SIAMCHART_PRICE_URL: str = "http://siamchart.com/stock/"
 SIAMCHART_PRICE_DATE_XPATH: str = r'//*[@id="content_body"]/div/div[6]'
 CHROME_WEBDRIVER_PATH: str = r"driver/chromedriver_v131.exe"
-N_THREADS: int = 25
+N_THREADS: int = 8
 
 # Const: Directories
 __DATA_DIR = "set_stock_list/"
 __PRICE_DIR = 'backup/'
 __LATEST_DOWNLOADED_PRICE_FULLPATH = f"{__PRICE_DIR}/close_price.csv"
+__LATEST_DOWNLOADED_VOLUME_FULLPATH = f"{__PRICE_DIR}/volume.csv"
 __LATEST_COMPUTED_RETURN_FULLPATH = f"{__PRICE_DIR}/return.csv"
+__LATEST_STOCK_STATS_FULLPATH = f"{__PRICE_DIR}/stats_fundamentals.csv"
 __SET_LIST_FILENAME_PREFIX = rf"{__DATA_DIR}listedCompanies_en_US"  # without .xlsx
 __YEARLY_OUTPUT_DIRECTORY = "./yearly/"
 __REQUIRED_DIRS = ['./log/', './backup/', './set_stock_list/']
@@ -144,6 +156,14 @@ def get_SET_stock_list() -> list[str]:
                                 f"Source URL = {__SET_LIST_STOCKS_URL}")
 
     return _t['Symbol'].astype(str).tolist()
+
+
+# noinspection PyPep8Naming
+def get_SET_stock_sectors() -> pd.Series:
+    """Bare symbol -> Sector, reusing the same scraped SET listed-company table (has an Industry/Sector column)."""
+    _p = f"{__SET_LIST_FILENAME_PREFIX}.html"
+    _t = pd.read_html(_p, header=1)[0]
+    return _t.set_index('Symbol')['Sector'].astype(str)
 
 
 # noinspection PyPep8Naming
@@ -242,6 +262,8 @@ if __name__ == '__main__':
                                    .sort_index()
                                    .dropna(axis=0, thresh=N_PRICE_THRESHOLD_DATE)
                                    .dropna(axis=1, thresh=N_PRICE_THRESHOLD_UNDERLYING))
+        # Volume for chart-pattern detection (breakout confirmation) - same filtering as df_prices.
+        df_volume: pd.DataFrame = df_mega_price['Volume'].reindex(index=df_prices.index, columns=df_prices.columns)
 
         # Can safely check with today() here cuz yf is always real-time due to end=None
         if (pd.Timestamp.today() not in df_prices.index) and not SKIP_TODAY_PRICE_DOWNLOAD:
@@ -268,6 +290,12 @@ if __name__ == '__main__':
         df_prices_loaded = pd.read_csv(__LATEST_DOWNLOADED_PRICE_FULLPATH,
                                        index_col=0, parse_dates=True)
         df_prices = df_prices_loaded
+        if os.path.isfile(__LATEST_DOWNLOADED_VOLUME_FULLPATH):
+            df_volume = pd.read_csv(__LATEST_DOWNLOADED_VOLUME_FULLPATH, index_col=0, parse_dates=True)
+        else:
+            lggr.warning(f"{__LATEST_DOWNLOADED_VOLUME_FULLPATH} not found - "
+                        f"breakout/volume pattern columns will be all-NaN this run.")
+            df_volume = pd.DataFrame(index=df_prices.index, columns=df_prices.columns, dtype=float)
 
     # Recording price source for reference
     df_price_source = pd.DataFrame(index=df_prices.index,
@@ -311,9 +339,14 @@ if __name__ == '__main__':
                   f"However, there are more than {na_cutoff * 100:.1f}% of the stock price missing. "
                   f"Therefore, the price on this day is dropped entirely.")
         df_prices = df_prices.drop(labels=latest_date_ts, axis=0)
+        latest_date_ts = df_prices.index.max()  # re-derive: the row we were pointing at is gone
     lggr.info(f"Price data are available "
               f"from {df_prices.index.min().strftime('%Y-%m-%d')} "
               f"to {df_prices.index.max().strftime('%Y-%m-%d')}.")
+
+    # Realign volume to whatever df_prices ended up being (siamchart append / na-cutoff drop above
+    # can add/remove rows after df_volume was first built) - missing volume just means patterns don't confirm.
+    df_volume = df_volume.reindex(index=df_prices.index, columns=df_prices.columns)
 
     # Stats: Fundamentals
     df_stats_fundamentals: pd.DataFrame
@@ -326,6 +359,13 @@ if __name__ == '__main__':
         # stock becomes NaN instead of raising and dropping the friendly column renaming for everyone.
         df_stats_fundamentals = df_stats.reindex(columns=list(REQUIRED_STATS_FUNDAMENTALS.keys())).copy()
         df_stats_fundamentals.columns = list(REQUIRED_STATS_FUNDAMENTALS.values())
+
+        # Backfill fields Yahoo didn't return this run (e.g. rate-limited) from the last successful
+        # run's cache. Fundamentals change quarterly, so a stale value is far better than NaN.
+        if os.path.isfile(__LATEST_STOCK_STATS_FULLPATH):
+            df_stats_fundamentals_cached = pd.read_csv(__LATEST_STOCK_STATS_FULLPATH, index_col=0)
+            df_stats_fundamentals = df_stats_fundamentals.combine_first(df_stats_fundamentals_cached) \
+                .reindex(df_stats_fundamentals.index)
 
         # df_stats_fundamentals can contain stocks yfinance had fundamentals for but that got
         # dropped from df_prices (insufficient price history) - only compute 52wHighToClosePrice
@@ -401,6 +441,53 @@ if __name__ == '__main__':
     if len(df_rs_rank.index.difference(df_period_ranks.index)):
         pass  # place for warning
 
+    # %% Stats: Technical (price/volume only - replaces fundamentals as the extra-info columns)
+    lggr.info("Computing technical pattern signals (base tightness, breakout, market/sector regime).")
+    # latest_date_ts already computed earlier (post price-finalization, incl. re-derivation after the
+    # na_cutoff drop) - not recomputed here since nothing between there and here touches df_prices' index.
+
+    df_high_n = df_prices.rolling(BASE_LOOKBACK).max()
+    df_low_n = df_prices.rolling(BASE_LOOKBACK).min()
+    df_tight_base = ((df_high_n - df_low_n) / df_low_n) <= BASE_TIGHTNESS_MAX
+
+    df_prior_high = df_prices.shift(1).rolling(BREAKOUT_LOOKBACK).max()
+    df_vol_ratio = df_volume / df_volume.rolling(VOLUME_AVG_WINDOW).mean().replace(0, np.nan)
+    df_breakout = (df_prices > df_prior_high) & (df_vol_ratio >= BREAKOUT_VOLUME_MULT)
+
+    sr_high_to_close_252d = df_prices.rolling(252).max().loc[latest_date_ts] / df_prices.loc[latest_date_ts] - 1.0
+
+    # Market regime: equal-weight proxy built from the already-downloaded SET universe itself,
+    # rather than guessing an external index ticker symbol.
+    sr_market_index = (1 + df_prices.pct_change(fill_method=None).mean(axis=1).fillna(0)).cumprod()
+    sr_market_regime_up = sr_market_index > sr_market_index.rolling(MARKET_TREND_WINDOW).mean()
+
+    # Liquidity proxy (replaces marketCap as the "can I actually size into this" filter).
+    sr_liquidity_20d = (df_prices * df_volume).rolling(20).mean().loc[latest_date_ts]
+
+    # Sector RS: reuse the Sector column already scraped in the SET listed-company table -
+    # no separate sector-index download needed. SET marks funds/REITs/unclassified names with
+    # Sector == '-' ; averaging RS across that bucket would fabricate a meaningful-looking number
+    # for names that aren't really comparable, so it's excluded from the sector grouping (NaN'd instead).
+    sr_stock_sector = get_SET_stock_sectors().reindex([s.split('.')[0] for s in df_rs_rank.columns])
+    sr_stock_sector.index = df_rs_rank.columns
+    sr_stock_sector_classified = sr_stock_sector.replace(['-', 'nan'], np.nan)
+    df_sector_rs = df_rs_rank.T.groupby(sr_stock_sector_classified).mean().T  # date x sector, avg RS Score per sector
+
+    df_stats_technical = pd.DataFrame(index=df_prices.columns)
+    df_stats_technical['TightBase'] = df_tight_base.loc[latest_date_ts]
+    df_stats_technical['BreakoutVolumeConfirmed'] = df_breakout.loc[latest_date_ts]
+    df_stats_technical['VolumeRatio'] = df_vol_ratio.loc[latest_date_ts]
+    df_stats_technical['HighToClose_252d'] = sr_high_to_close_252d
+    df_stats_technical['AvgValue_20d'] = sr_liquidity_20d
+    df_stats_technical['MarketRegimeUp'] = sr_market_regime_up.loc[latest_date_ts]
+    df_stats_technical['Sector'] = sr_stock_sector
+    df_stats_technical['SectorRS'] = sr_stock_sector_classified.map(df_sector_rs.loc[latest_date_ts])
+
+    if not sr_market_regime_up.loc[latest_date_ts]:
+        lggr.warning(f"Market regime (equal-weight SET proxy) is currently in a DOWNTREND "
+                    f"(below its {MARKET_TREND_WINDOW}-day average) - "
+                    f"consider reducing new long exposure regardless of RS Score.")
+
     # At this point, we collect df_rs_rank, df_rs, df_period_ranks,
     if DAILY_OPERATION:
         date_to_produce: list[datetime.date] = [df_prices.index.max().date()]
@@ -467,7 +554,7 @@ if __name__ == '__main__':
 
         df_output_d.sort_values(by=f'RS Rating (Type {filling_mode})', ascending=False, inplace=True)
         if ts_d == latest_date_ts:
-            df_output_d = df_output_d.join(df_stats_fundamentals)
+            df_output_d = df_output_d.join(df_stats_fundamentals).join(df_stats_technical)
         for writer in [writer_backup, writer_recent]:
             df_output_d.to_excel(writer, sheet_name=d.strftime("%Y%m%d"))
     for writer_backup, writer_recent in dict_writers.values():
@@ -490,8 +577,13 @@ if __name__ == '__main__':
         lggr.info("Dumping backup outputs")
         lggr.info(f"Dumping close prices to {__LATEST_DOWNLOADED_PRICE_FULLPATH}")
         df_prices.to_csv(__LATEST_DOWNLOADED_PRICE_FULLPATH)
+        lggr.info(f"Dumping volumes to {__LATEST_DOWNLOADED_VOLUME_FULLPATH}")
+        df_volume.to_csv(__LATEST_DOWNLOADED_VOLUME_FULLPATH)
         lggr.info(f"Dumping returns to {__LATEST_COMPUTED_RETURN_FULLPATH}")
         df_returns.to_csv(__LATEST_COMPUTED_RETURN_FULLPATH)
+        if not SKIP_STOCK_STATISTICS and not df_stats_fundamentals.empty:
+            lggr.info(f"Dumping stock statistics to {__LATEST_STOCK_STATS_FULLPATH}")
+            df_stats_fundamentals.to_csv(__LATEST_STOCK_STATS_FULLPATH)
     else:
         lggr.info("Writing return and price routine skipped.")
     print("Script executed successfully.")

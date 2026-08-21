@@ -9,3 +9,5 @@ set_stock_list/*
 *.xlsx
 watchlist_*.txt
 siamchart_missing_stocks.txt
+backtest/*.csv
+backtest/*.png
